@@ -1291,9 +1291,7 @@ fn print_usage() {
     println!("  aegira install");
     println!("  aegira status");
     println!("  aegira show-rules");
-    println!("  aegira history [count]");
-    println!("  aegira uninstall");
-    println!("  aegira version");
+    println!("  aegira history");
     println!("  aegira configure service <name>");
     println!("  aegira configure container <name>");
     println!("  aegira configure alerts <on|off> [recipient_email]");
@@ -1611,87 +1609,11 @@ fn run_status() -> Result<(), String> {
     }
 }
 
-fn run_history(args: &[String]) -> Result<(), String> {
+fn run_history() -> Result<(), String> {
     ensure_environment_setup()?;
-
-    let count = match args.get(2) {
-        Some(value) => value.parse::<usize>()
-            .map_err(|_| "History count must be a positive integer.".to_string())?,
-        None => 20,
-    };
-
-    if count == 0 {
-        return Err("History count must be greater than zero.".to_string());
-    }
-
     let contents = fs::read_to_string(INCIDENT_LOG_PATH)
         .map_err(|e| format!("Failed to read incident log: {}", e))?;
-
-    let mut incidents: Vec<Vec<&str>> = Vec::new();
-    let mut current: Vec<&str> = Vec::new();
-
-    for line in contents.lines() {
-        if line.contains("[WATCHER] Incident detected:") {
-            if !current.is_empty() {
-                incidents.push(current);
-                current = Vec::new();
-            }
-            current.push(line);
-        } else if !current.is_empty() {
-            current.push(line);
-        }
-    }
-
-    if !current.is_empty() {
-        incidents.push(current);
-    }
-
-    let start = incidents.len().saturating_sub(count);
-    let selected = &incidents[start..];
-
-    println!("Aegira incident history (showing {} of {} incidents)", selected.len(), incidents.len());
-    println!();
-
-    if selected.is_empty() {
-        println!("No incidents recorded.");
-        return Ok(());
-    }
-
-    for (index, incident) in selected.iter().enumerate() {
-        println!("--- Incident {} ---", start + index + 1);
-        for line in incident {
-            println!("{}", line);
-        }
-        println!();
-    }
-
-    Ok(())
-}
-
-fn run_uninstall() -> Result<(), String> {
-    if unsafe { libc_geteuid() } != 0 {
-        return Err("Uninstallation must be run as root. Use: sudo aegira uninstall".to_string());
-    }
-
-    let systemctl = systemctl_binary()?;
-    let _ = Command::new(systemctl).args(["disable", "--now", "aegira.service"]).output();
-
-    let service_path = Path::new("/etc/systemd/system/aegira.service");
-    if service_path.exists() {
-        fs::remove_file(service_path)
-            .map_err(|e| format!("Failed to remove {}: {}", service_path.display(), e))?;
-    }
-
-    execute_command(systemctl, &["daemon-reload"])?;
-
-    println!("[UNINSTALL] Aegira service removed.");
-    println!("[UNINSTALL] Configuration, rules, logs, and Composio credentials were preserved.");
-    println!("[UNINSTALL] Remove /etc/aegira and /var/log/aegira manually if you want a full data purge.");
-    Ok(())
-}
-
-fn run_version() -> Result<(), String> {
-    println!("Aegira Pro v3.0.0");
+    println!("{}", contents);
     Ok(())
 }
 
@@ -1733,15 +1655,7 @@ fn main() {
             }
         }
         "license" => run_license(&args),
-        "history" => {
-            if args.len() > 3 {
-                Err("Usage: aegira history [count]".to_string())
-            } else {
-                run_history(&args)
-            }
-        }
-        "uninstall" => run_uninstall(),
-        "version" => run_version(),
+        "history" => run_history(),
         "show-rules" => {
             if let Err(e) = ensure_environment_setup() {
                 Err(e)

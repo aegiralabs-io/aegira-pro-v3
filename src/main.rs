@@ -22,6 +22,10 @@ const COMMAND_TIMEOUT_SECS: u64 = 20;
 const VERIFY_DELAY_SECS: u64 = 2;
 const MAX_VERIFY_ATTEMPTS: u32 = 5;
 const INCIDENT_COOLDOWN_SECS: u64 = 30;
+const MAX_RECOVERY_FAILURES: u32 = 3;
+const RECOVERY_FAILURE_WINDOW_SECS: u64 = 300;
+const MAX_COMMAND_SEQUENCE_LENGTH: usize = 5;
+const MAX_COMMAND_LENGTH: usize = 1024;
 const MAX_INCIDENT_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 const MIN_MATCH_SCORE: i32 = 60;
@@ -172,6 +176,9 @@ enum Remediation {
     #[serde(rename = "container_restart")]
     ContainerRestart { container: String },
 
+    #[serde(rename = "command_sequence")]
+    CommandSequence { commands: Vec<String> },
+
     #[serde(rename = "alert_only")]
     AlertOnly,
 }
@@ -193,6 +200,12 @@ enum Verification {
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[derive(Debug)]
+struct RecoveryState {
+    failures: u32,
+    first_failure: Instant,
 }
 
 fn get_aegira_dir() -> PathBuf {
@@ -383,6 +396,41 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
                     "Rule '{}' has an empty container",
                     rule.id
                 ));
+            }
+        }
+
+        Remediation::CommandSequence { commands } => {
+            if commands.is_empty() {
+                return Err(format!("Rule '{}' has an empty command sequence", rule.id));
+            }
+            if commands.len() > MAX_COMMAND_SEQUENCE_LENGTH {
+                return Err(format!(
+                    "Rule '{}' has too many commands. Maximum is {}",
+                    rule.id, MAX_COMMAND_SEQUENCE_LENGTH
+                ));
+            }
+            for (index, command) in commands.iter().enumerate() {
+                let command = command.trim();
+                if command.is_empty() {
+                    return Err(format!("Rule '{}' command {} is empty", rule.id, index + 1));
+                }
+                if command.len() > MAX_COMMAND_LENGTH {
+                    return Err(format!(
+                        "Rule '{}' command {} exceeds {} characters",
+                        rule.id, index + 1, MAX_COMMAND_LENGTH
+                    ));
+                }
+                let normalized = command.to_lowercase();
+                if normalized.contains("systemctl restart aegira")
+                    || normalized.contains("systemctl stop aegira")
+                    || normalized.contains("systemctl start aegira")
+                    || normalized.contains("service aegira")
+                {
+                    return Err(format!(
+                        "Rule '{}' command {} attempts to control Aegira itself",
+                        rule.id, index + 1
+                    ));
+                }
             }
         }
 
@@ -803,6 +851,73 @@ fn execute_command(
     }
 }
 
+fn execute_command_sequence(commands: &[String]) -> Result<(), String> {
+    if commands.is_empty() {
+        return Err("Command sequence is empty".to_string());
+    }
+    if commands.len() > MAX_COMMAND_SEQUENCE_LENGTH {
+        return Err(format!(
+            "Command sequence exceeds maximum of {} commands",
+            MAX_COMMAND_SEQUENCE_LENGTH
+        ));
+    }
+
+    for (index, command) in commands.iter().enumerate() {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(format!("Command {} is empty", index + 1));
+        }
+
+        log_incident(&format!(
+            "[COMMAND {} / {}] {}",
+            index + 1, commands.len(), command
+        ));
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", command])
+            .spawn()
+            .map_err(|e| format!("Failed to start command {}: {}", index + 1, e))?;
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        log_incident(&format!(
+                            "[COMMAND {} / {}] Completed successfully",
+                            index + 1, commands.len()
+                        ));
+                        break;
+                    }
+                    return Err(format!(
+                        "Command {} exited with status {}", index + 1, status
+                    ));
+                }
+                Ok(None) => {
+                    if start.elapsed() >= Duration::from_secs(COMMAND_TIMEOUT_SECS) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "Command {} timed out after {} seconds",
+                            index + 1, COMMAND_TIMEOUT_SECS
+                        ));
+                    }
+                    sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Failed waiting for command {}: {}", index + 1, e
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn env_value(name: &str) -> Option<String> {
     if let Ok(value) = std::env::var(name) {
         if !value.trim().is_empty() {
@@ -933,6 +1048,13 @@ fn perform_remediation(remediation: &Remediation) -> Result<(), String> {
             log_incident(&format!("[RECOVERY] Restarting container: {}", target));
             execute_command(docker, &["restart", target.as_str()])
         }
+        Remediation::CommandSequence { commands } => {
+            log_incident(&format!(
+                "[RECOVERY] Executing command sequence ({} commands)",
+                commands.len()
+            ));
+            execute_command_sequence(commands)
+        }
         Remediation::AlertOnly => {
             log_incident("[RECOVERY] Alert-only remediation selected. No recovery action executed.");
             Ok(())
@@ -997,8 +1119,7 @@ fn verify_recovery(verification: &Verification) -> bool {
             match Command::new(docker).args(["inspect", "-f", "{{.State.Running}}", target.as_str()]).output() {
                 Ok(output) => {
                     let running = output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true";
-                    if running {
-                        log_incident("[VERIFY] Container is running");
+                    if running {log_incident("[VERIFY] Container is running");
                     } else {
                         log_incident("[VERIFY] Container is NOT running");
                     }
@@ -1102,6 +1223,9 @@ fn describe_remediation(remediation: &Remediation) -> String {
         Remediation::ContainerRestart { container } => {
             format!("docker restart {}", container)
         }
+        Remediation::CommandSequence { commands } => {
+            format!("{} command(s): {}", commands.len(), commands.join(" && "))
+        }
         Remediation::AlertOnly => "no remediation".to_string(),
     }
 }
@@ -1110,6 +1234,7 @@ fn process_incident(
     rules: &[Rule],
     incident: &str,
     cooldowns: &mut HashMap<String, Instant>,
+    recovery_states: &mut HashMap<String, RecoveryState>,
 ) {
     cleanup_cooldowns(cooldowns);
 
@@ -1165,6 +1290,26 @@ fn process_incident(
         Instant::now(),
     );
 
+    let recovery_key = rule.id.trim().to_lowercase();
+    if let Some(state) = recovery_states.get(&recovery_key) {
+        if state.first_failure.elapsed() < Duration::from_secs(RECOVERY_FAILURE_WINDOW_SECS)
+            && state.failures >= MAX_RECOVERY_FAILURES
+        {
+            log_incident(&format!(
+                "[CIRCUIT BREAKER] Rule '{}' has reached {} failed recovery attempts. Automatic recovery is paused.",
+                rule.id, MAX_RECOVERY_FAILURES
+            ));
+            log_incident(&format!(
+                "[MANUAL ACTION] Rule '{}' requires intervention", rule.id
+            ));
+            send_alert(
+                &format!("Aegira: {} recovery circuit breaker", rule.name),
+                &alert_body(incident, Some(rule), "AUTO-RECOVERY PAUSED - MANUAL ACTION REQUIRED"),
+            );
+            return;
+        }
+    }
+
     log_incident(&format!(
         "[MATCH] Rule: {}",
         rule.name
@@ -1212,6 +1357,7 @@ fn process_incident(
 
     match recover_with_rule(rule) {
         Ok(()) => {
+            recovery_states.remove(&recovery_key);
             log_incident(&format!(
                 "[RESOLVED] Incident automatically recovered in {:.2?}",
                 start.elapsed()
@@ -1225,15 +1371,39 @@ fn process_incident(
         }
 
         Err(e) => {
+            let now = Instant::now();
+            let state = recovery_states
+                .entry(recovery_key.clone())
+                .or_insert_with(|| RecoveryState {
+                    failures: 0,
+                    first_failure: now,
+                });
+
+            if state.first_failure.elapsed() >= Duration::from_secs(RECOVERY_FAILURE_WINDOW_SECS) {
+                state.failures = 0;
+                state.first_failure = now;
+            }
+
+            state.failures += 1;
+
+            log_incident(&format!("[RECOVERY FAILED] {}", e));
             log_incident(&format!(
-                "[RECOVERY FAILED] {}",
-                e
+                "[RECOVERY ATTEMPT] {}/{} failed for rule '{}'",
+                state.failures, MAX_RECOVERY_FAILURES, rule.id
             ));
 
-            log_incident(&format!(
-                "[MANUAL ACTION] Rule '{}' requires intervention",
-                rule.id
-            ));
+            if state.failures >= MAX_RECOVERY_FAILURES {
+                log_incident(&format!(
+                    "[CIRCUIT BREAKER] Automatic recovery paused for rule '{}' after {} failed attempts",
+                    rule.id, MAX_RECOVERY_FAILURES
+                ));
+            } else {
+                log_incident(&format!(
+                    "[MANUAL ACTION] Rule '{}' may retry on a subsequent incident",
+                    rule.id
+                ));
+            }
+
             send_alert(
                 &format!("Aegira: {} recovery failed", rule.name),
                 &alert_body(incident, Some(rule), "RECOVERY FAILED - MANUAL ACTION REQUIRED"),
@@ -1330,6 +1500,7 @@ fn run_monitor() {
         }
     };
     let mut cooldowns: HashMap<String, Instant> = HashMap::new();
+    let mut recovery_states: HashMap<String, RecoveryState> = HashMap::new();
     log_incident("[INFO] Monitoring new log entries...");
 
     loop {
@@ -1406,7 +1577,7 @@ fn run_monitor() {
                 position = line_start + bytes_read as u64;
                 let trimmed = line.trim();
                 if trimmed.contains("[ERROR]") || trimmed.contains("[CRITICAL]") {
-                    process_incident(&rules, trimmed, &mut cooldowns);
+                    process_incident(&rules, trimmed, &mut cooldowns, &mut recovery_states);
                 }
             }
         }
